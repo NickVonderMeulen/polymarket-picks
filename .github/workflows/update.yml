@@ -1,0 +1,41 @@
+name: Update Polymarket picks
+
+on:
+  schedule:
+    - cron: "0 13 * * *"      # daily, about 8-9 AM Eastern
+  workflow_dispatch:           # adds the manual "Run workflow" button
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-picks
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build the picks page (emails only on the daily schedule)
+        env:
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          BANKROLL: ${{ vars.BANKROLL }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then EMAIL="--email"; else EMAIL=""; fi
+          python polytracker.py $EMAIL --out docs/index.html --db data/picks.db
+      - name: Save results back to the repo
+        run: |
+          git config user.name "polytracker-bot"
+          git config user.email "polytracker-bot@users.noreply.github.com"
+          git add docs data
+          git diff --cached --quiet || git commit -m "Update picks"
+          git push
