@@ -57,7 +57,7 @@ CONFIG = {
     "max_listed": 25,
     # The cutoff line: a pick is "above the line" only if ALL of these hold
     "cutoff_score": 60,
-    "min_wallets_bet": 3,
+    "min_wallets_bet": 2,
     "min_price": 0.10,
     "max_price": 0.85,
     "max_drift": 0.08,             # price may not be more than 8c above their average entry
