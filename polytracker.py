@@ -48,9 +48,9 @@ REPORT_PATH = os.path.join(HERE, "report.html")
 CONFIG = {
     # Who to follow
     "windows": ["week", "month", "all"],
-    "leaderboard_size": 40,        # top N per window
+    "leaderboard_size": 50,        # top N per window
     "min_windows": 2,              # wallet must be top-N in this many windows
-    "max_wallets": 30,
+    "max_wallets": 50,
     # What counts as a candidate
     "min_position_usd": 100,       # ignore tiny positions by a wallet
     "min_wallets_listed": 2,       # list anything with at least this many wallets agreeing
