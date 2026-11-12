@@ -2,7 +2,8 @@ name: Update Polymarket picks
 
 on:
   schedule:
-    - cron: "0 13 * * *"      # daily, about 8-9 AM Eastern
+    - cron: "23 15 * * *"
+    - cron: "23 23 * * *" # daily, about 8-9 AM Eastern
   workflow_dispatch:           # adds the manual "Run workflow" button
 
 permissions:
