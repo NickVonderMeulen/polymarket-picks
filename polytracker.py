@@ -1007,10 +1007,30 @@ a:hover{text-decoration:underline}
 .tabbtn{background:#fff;border:1px solid #e5e7eb;border-radius:999px;padding:7px 16px;font-size:13px;font-weight:600;color:#4b5563;cursor:pointer;font-family:inherit}
 .tabbtn.on{background:#111827;color:#fff;border-color:#111827}
 .scroll{overflow-x:auto}
+.chips{display:none;gap:6px;margin:12px 0 0;flex-wrap:wrap}
+.js .chips{display:flex}
+.chip{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;color:#4b5563;cursor:pointer;font-family:inherit}
+.chip.on{background:#eef2ff;border-color:#a5b4fc;color:#3730a3}
 .paneh{margin:22px 0 4px;font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:#4338ca}
+@media (prefers-color-scheme:dark){.chip{background:#171b23;border-color:#262c38;color:#aab3c2}.chip.on{background:#232a52;border-color:#4b55a8;color:#c7d2fe}}
 @media (prefers-color-scheme:dark){.tabbtn{background:#171b23;border-color:#262c38;color:#aab3c2}.tabbtn.on{background:#e5e7eb;color:#111827;border-color:#e5e7eb}.paneh{color:#a5b4fc}}
 @media (max-width:520px){.facts td{display:inline-block;width:46%;padding-bottom:8px}.stats{border-spacing:6px 0}}
 """
+
+
+SPORT_WORDS = ("sport", "nba", "nfl", "nhl", "mlb", "wnba", "ncaa", "soccer", "football", "basketball", "baseball",
+               "hockey", "tennis", "golf", "ufc", "mma", "boxing", "formula", "f1", "premier league", "champions league", "olympic")
+
+
+def pick_group(p):
+    t = (p.get("category") or "").lower()
+    if any(w in t for w in SPORT_WORDS):
+        return "sports"
+    if "politic" in t or "election" in t:
+        return "politics"
+    if "crypto" in t or "bitcoin" in t or "ethereum" in t:
+        return "crypto"
+    return "other"
 
 
 def money(x):
@@ -1131,7 +1151,7 @@ def card(i, p, wallets):
     else:
         extra = "<div class='why'><b>Below the line:</b> %s</div>" % escape("; ".join(p["why"]))
     return (
-        "<div class='card %s'>" % p["tier"] +
+        "<div class='card %s' data-g='%s'>" % (p["tier"], pick_group(p)) +
         "<table class='row1'><tr><td class='rank'>%d</td><td class='ttl'>%s</td>" % (i, title_html) +
         "<td class='sc'><span class='pill %s'>%.0f</span><div class='sclabel'>of 100</div></td></tr></table>" % (
             pill_class(p["score"], p["tier"]), p["score"]) +
@@ -1260,6 +1280,15 @@ def picks_section(picks, wallets, ctx, include_below=True):
                          "keep everything you have open under that.</div>" % (
                              format(bk, ",.0f"), floor, 100 * floor / bk, CONFIG["stake_pct_max"] * 100,
                              ctx.get("exposure_cap", 0), CONFIG["max_total_exposure_pct"] * 100))
+    if include_below:
+        counts = defaultdict(int)
+        for p in picks:
+            counts[pick_group(p)] += 1
+        chips = ["<button class='chip' data-f='all'>All (%d)</button>" % len(picks)]
+        for key, label in (("sports", "Sports"), ("politics", "Politics"), ("crypto", "Crypto"), ("other", "Other")):
+            if counts[key]:
+                chips.append("<button class='chip' data-f='%s'>%s (%d)</button>" % (key, label, counts[key]))
+        parts.append("<div class='chips'>%s</div>" % "".join(chips))
     parts.append("<div class='sec go'>Above the line</div>"
                  "<p class='note'>Passes every safety filter: enough independent top wallets agree, the price you would actually pay "
                  "has not run away from their entries, liquidity is adequate, they are not selling, and it is not the same event as a better pick.</p>")
@@ -1316,6 +1345,18 @@ function show(id){
  try{history.replaceState(null,'','#'+id);}catch(e){}
 }
 for(var k=0;k<btns.length;k++){(function(b){b.addEventListener('click',function(){show(b.getAttribute('data-t'));});})(btns[k]);}
+var chips=document.querySelectorAll('.chip');
+function filt(f){
+ var cards=document.querySelectorAll('.card[data-g]');
+ for(var i=0;i<cards.length;i++){cards[i].style.display=(f==='all'||cards[i].getAttribute('data-g')===f)?'':'none';}
+ for(var j=0;j<chips.length;j++){chips[j].className='chip'+(chips[j].getAttribute('data-f')===f?' on':'');}
+ try{localStorage.setItem('pmfilter',f);}catch(e){}
+}
+for(var m=0;m<chips.length;m++){(function(c){c.addEventListener('click',function(){filt(c.getAttribute('data-f'));});})(chips[m]);}
+var saved='all';
+try{saved=localStorage.getItem('pmfilter')||'all';}catch(e){}
+if(!document.querySelector('.chip[data-f="'+saved+'"]')){saved='all';}
+filt(saved);
 var h=location.hash.slice(1);
 show(h&&document.getElementById(h)?h:'picks');
 })();
