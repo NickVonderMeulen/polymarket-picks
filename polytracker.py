@@ -52,6 +52,9 @@ DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Change this whenever you change the scoring or the rules. Picks are stamped with it, and the Results verdict
+# counts only picks made under the current version, so every rule set gets its own clean paper-trade sample.
+ENGINE_VERSION = "2.2"
 DB_PATH = os.environ.get("DB_PATH", os.path.join(HERE, "picks.db"))
 REPORT_PATH = os.path.join(HERE, "report.html")
 
@@ -382,7 +385,7 @@ def gamma_market(condition_id, closed_fallback=False):
 
 def market_info(m):
     """Slug, dates, category and outcome->token map from a Gamma market. Missing pieces are ''."""
-    out = {"slug": "", "event_slug": "", "start": "", "end": "", "category": "", "tokens": {}}
+    out = {"slug": "", "event_slug": "", "start": "", "end": "", "category": "", "tokens": {}, "is_sports": False}
     if not m:
         return out
     evs = m.get("events") or [{}]
@@ -391,8 +394,14 @@ def market_info(m):
     out["slug"] = ev.get("slug") or m.get("slug") or ""
     out["start"] = m.get("gameStartTime") or ""   # real game start times only; an event's listing date is not a start
     out["end"] = m.get("endDate") or ev.get("endDate") or ""
-    tags = " ".join(str(t.get("label", "")) for t in (ev.get("tags") or []) if isinstance(t, dict))
-    out["category"] = (str(m.get("category") or ev.get("category") or "") + " " + tags).strip().lower()
+    tag_items = list(m.get("tags") or []) + list(ev.get("tags") or [])
+    tags = " ".join("%s %s" % (t.get("label") or "", t.get("slug") or "") for t in tag_items if isinstance(t, dict))
+    cat_items = list(m.get("categories") or []) + list(ev.get("categories") or [])
+    cats = " ".join(str(c.get("label") or "") for c in cat_items if isinstance(c, dict))
+    # Polymarket marks game markets with these fields even when no text category is set
+    out["is_sports"] = bool(m.get("sportsMarketType") or m.get("gameId") or m.get("teamAID") or m.get("teamBID"))
+    out["category"] = ("%s %s %s%s" % (m.get("category") or ev.get("category") or "", cats, tags,
+                                       " sports" if out["is_sports"] else "")).strip().lower()
     out["tokens"] = dict(zip(json_list(m.get("outcomes")), json_list(m.get("clobTokenIds"))))
     return out
 
@@ -735,6 +744,7 @@ def enrich(p):
     p["start"] = info["start"]
     p["end"] = info["end"] or p["end"]
     p["category"] = info["category"]
+    p["is_sports"] = info["is_sports"]
     p["fee_rate"] = fee_rate_for(info["category"])
     for name, board in _CAT_BOARDS.items():
         if name[:5] in info["category"]:
@@ -799,20 +809,43 @@ def assign_stakes(picks):
 
 
 # ---------------- Step 5: paper-trade log + track record ----------------
+PICK_COLS = [("flagged_at", "TEXT"), ("condition_id", "TEXT"), ("outcome", "TEXT"), ("title", "TEXT"),
+             ("entry_price", "REAL"), ("wallets", "INTEGER"), ("score", "REAL"), ("tier", "TEXT"), ("exec_price", "REAL"),
+             ("bet_at", "TEXT"), ("bet_price", "REAL"), ("last_score", "REAL"), ("slug", "TEXT"), ("end_date", "TEXT"),
+             ("resolved", "INTEGER"), ("final_price", "REAL"), ("last_price", "REAL"), ("last_checked", "TEXT"),
+             ("engine", "TEXT")]
+
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("""CREATE TABLE IF NOT EXISTS picks (
         id INTEGER PRIMARY KEY, flagged_at TEXT, condition_id TEXT, outcome TEXT, title TEXT,
-        entry_price REAL, wallets INTEGER, score REAL, UNIQUE(condition_id, outcome))""")
+        entry_price REAL, wallets INTEGER, score REAL)""")
     have = {r[1] for r in con.execute("PRAGMA table_info(picks)")}
-    for name, typ in [("tier", "TEXT"), ("exec_price", "REAL"), ("bet_at", "TEXT"), ("bet_price", "REAL"),
-                      ("last_score", "REAL"), ("slug", "TEXT"), ("end_date", "TEXT"), ("resolved", "INTEGER"),
-                      ("final_price", "REAL"), ("last_price", "REAL"), ("last_checked", "TEXT")]:
+    for name, typ in PICK_COLS:
         if name not in have:
             con.execute("ALTER TABLE picks ADD COLUMN %s %s" % (name, typ))
+    # Picks logged before versions existed were made under older, different rules.
+    con.execute("UPDATE picks SET engine = 'earlier' WHERE engine IS NULL")
     # Older versions only stored the tier a pick had when first seen. Treat those 'bet' rows as bets at that time.
     con.execute("UPDATE picks SET bet_at = flagged_at, bet_price = entry_price WHERE tier = 'bet' AND bet_at IS NULL")
+    con.commit()
+    # Older databases allow one row per market. Rebuild so each rules version can log the same market separately.
+    sql = (con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'picks'").fetchone() or [""])[0] or ""
+    if "UNIQUE" in sql.upper():
+        names = [r[1] for r in con.execute("PRAGMA table_info(picks)")]
+        con.execute("BEGIN")
+        try:
+            con.execute("ALTER TABLE picks RENAME TO picks_old")
+            con.execute("CREATE TABLE picks (id INTEGER PRIMARY KEY, %s)" % ", ".join("%s %s" % c for c in PICK_COLS))
+            con.execute("INSERT INTO picks (%s) SELECT %s FROM picks_old" % (", ".join(names), ", ".join(names)))
+            con.execute("DROP TABLE picks_old")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pick_key ON picks(condition_id, outcome, engine)")
     con.execute("""CREATE TABLE IF NOT EXISTS snapshots (
         ts TEXT, wallet TEXT, condition_id TEXT, outcome TEXT, shares REAL, value REAL)""")
     if "title" not in {r[1] for r in con.execute("PRAGMA table_info(snapshots)")}:
@@ -829,14 +862,14 @@ def log_picks(con, picks):
     for p in picks:
         price = entry_price(p)
         bet = p["tier"] == "bet"
-        row = con.execute("SELECT id, bet_at FROM picks WHERE condition_id = ? AND outcome = ?",
-                          (p["condition_id"], p["outcome"])).fetchone()
+        row = con.execute("SELECT id, bet_at FROM picks WHERE condition_id = ? AND outcome = ? AND engine = ?",
+                          (p["condition_id"], p["outcome"], ENGINE_VERSION)).fetchone()
         if row is None:
             con.execute(
                 "INSERT INTO picks(flagged_at, condition_id, outcome, title, entry_price, wallets, score, tier,"
-                " exec_price, last_score, slug, end_date, bet_at, bet_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " exec_price, last_score, slug, end_date, bet_at, bet_price, engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now, p["condition_id"], p["outcome"], p["title"], p["mid"], p["wallets"], p["score"], p["tier"],
-                 p["all_in"], p["score"], p["slug"], p["end"], now if bet else None, price if bet else None))
+                 p["all_in"], p["score"], p["slug"], p["end"], now if bet else None, price if bet else None, ENGINE_VERSION))
         else:
             if bet and not row["bet_at"]:
                 con.execute("UPDATE picks SET bet_at = ?, bet_price = ? WHERE id = ?", (now, price, row["id"]))
@@ -860,10 +893,16 @@ def summarize(items):
     if not items:
         return None
     res = [i for i in items if i["resolved"]]
+    opn = [i for i in items if not i["resolved"]]
     wins = sum(1 for i in res if i["cur"] > 0.5)
+
+    def avg(xs):
+        return (sum(xs) / len(xs)) if xs else None
     return {
-        "n": len(items), "resolved": len(res), "wins": wins,
+        "n": len(items), "resolved": len(res), "wins": wins, "open": len(opn),
         "avg_ret": sum(i["cur"] / i["entry"] - 1 for i in items) / len(items),
+        "settled_ret": avg([i["cur"] / i["entry"] - 1 for i in res]),
+        "open_ret": avg([i["cur"] / i["entry"] - 1 for i in opn]),
         "avg_move": sum((i["cur"] - i["entry"]) * 100 for i in items) / len(items),
         "breakeven": (sum(i["entry"] for i in res) / len(res)) if res else None,
         "ci": wilson(wins, len(res)) if res else None,
@@ -873,10 +912,11 @@ def summarize(items):
 def track_record(con, refresh=True):
     since = (datetime.now(timezone.utc) - timedelta(days=CONFIG["tracking_days"])).isoformat()
     cols = ("id, condition_id, outcome, entry_price, exec_price, bet_at, bet_price, last_score, "
-            "resolved, final_price, last_price")
+            "resolved, final_price, last_price, engine, flagged_at")
     rows = con.execute("SELECT " + cols + " FROM picks WHERE flagged_at >= ? ORDER BY flagged_at DESC", (since,)).fetchall()
     if refresh:
         lookups, seen = 0, {}
+        stamp = datetime.now(timezone.utc).isoformat()
         for r in rows:
             if r["resolved"]:
                 continue
@@ -892,13 +932,13 @@ def track_record(con, refresh=True):
             if price is None:
                 continue
             if closed:
-                con.execute("UPDATE picks SET resolved = 1, final_price = ?, last_price = ? WHERE id = ?",
-                            (1.0 if price > 0.5 else 0.0, price, r["id"]))
+                con.execute("UPDATE picks SET resolved = 1, final_price = ?, last_price = ?, last_checked = ? WHERE id = ?",
+                            (1.0 if price > 0.5 else 0.0, price, stamp, r["id"]))
             else:
-                con.execute("UPDATE picks SET last_price = ? WHERE id = ?", (price, r["id"]))
+                con.execute("UPDATE picks SET last_price = ?, last_checked = ? WHERE id = ?", (price, stamp, r["id"]))
         con.commit()
         rows = con.execute("SELECT " + cols + " FROM picks WHERE flagged_at >= ? ORDER BY flagged_at DESC", (since,)).fetchall()
-    bets, watch, all_items = [], [], []
+    bets, watch, all_items, old_bets, old_watch, started = [], [], [], [], [], []
     for r in rows:
         is_bet = bool(r["bet_at"])
         entry = r["bet_price"] if is_bet else (r["exec_price"] or r["entry_price"])
@@ -906,28 +946,40 @@ def track_record(con, refresh=True):
         if not entry or entry < 0.02 or cur is None:
             continue
         item = {"entry": entry, "cur": cur, "resolved": bool(r["resolved"]), "score": r["last_score"] or 0.0}
-        (bets if is_bet else watch).append(item)
-        all_items.append(item)
+        if r["engine"] == ENGINE_VERSION:
+            (bets if is_bet else watch).append(item)
+            all_items.append(item)
+            started.append(r["flagged_at"])
+        else:
+            (old_bets if is_bet else old_watch).append(item)
     buckets = []
     for lo, hi, label in [(90, 101, "90-100"), (80, 90, "80-89"), (70, 80, "70-79"), (60, 70, "60-69"), (0, 60, "Under 60")]:
         buckets.append((label, summarize([i for i in all_items if lo <= i["score"] < hi])))
-    return {"bet": summarize(bets), "watch": summarize(watch), "buckets": buckets, "total": len(all_items)}
+    return {"bet": summarize(bets), "watch": summarize(watch), "buckets": buckets, "total": len(all_items),
+            "engine": ENGINE_VERSION, "since": min(started)[:10] if started else None,
+            "earlier": {"bet": summarize(old_bets), "watch": summarize(old_watch), "n": len(old_bets) + len(old_watch)}}
 
 
 def print_track_record(tr):
-    if not tr["total"]:
-        print("No logged picks yet. Run the tracker for a few days first.")
-        return
-    for label, key in (("Above the line", "bet"), ("Below the line", "watch")):
-        s = tr[key]
+    def show(prefix, s):
         if not s:
-            print("%-15s no picks yet" % label)
-            continue
-        wr = ""
+            print("%-26s no picks yet" % prefix)
+            return
+        line = "%-26s %3d picks (%d settled, %d open)" % (prefix, s["n"], s["resolved"], s["open"])
         if s["resolved"]:
-            wr = "  win rate %d/%d (break-even about %.0f%%)" % (s["wins"], s["resolved"], s["breakeven"] * 100)
-        print("%-15s %3d picks, avg return %+.1f%%, avg move %+.1fc%s" % (label, s["n"], s["avg_ret"] * 100, s["avg_move"], wr))
-    print("\nBy score:")
+            line += ", won %d/%d (break-even about %.0f%%), return on settled %+.1f%%" % (
+                s["wins"], s["resolved"], s["breakeven"] * 100, s["settled_ret"] * 100)
+        if s["open"]:
+            line += ", open marked %+.1f%%" % (s["open_ret"] * 100)
+        print(line)
+    print("Rules version %s%s" % (tr["engine"], (" since " + tr["since"]) if tr["since"] else ""))
+    show("Above the line", tr["bet"])
+    show("Below the line", tr["watch"])
+    if tr["earlier"]["n"]:
+        print("\nEarlier rules (reference only, not used for the verdict):")
+        show("Above the line", tr["earlier"]["bet"])
+        show("Below the line", tr["earlier"]["watch"])
+    print("\nBy score (current rules):")
     for label, s in tr["buckets"]:
         if s:
             print("  %-9s %3d picks, avg return %+.1f%%" % (label, s["n"], s["avg_ret"] * 100))
@@ -1022,9 +1074,16 @@ SPORT_WORDS = ("sport", "nba", "nfl", "nhl", "mlb", "wnba", "ncaa", "soccer", "f
                "hockey", "tennis", "golf", "ufc", "mma", "boxing", "formula", "f1", "premier league", "champions league", "olympic")
 
 
+LEAGUE_PREFIXES = ("nba-", "nfl-", "nhl-", "mlb-", "wnba-", "cbb-", "cfb-", "ncaa", "epl-", "mls-", "ucl-", "uel-",
+                   "atp-", "wta-", "ufc-", "lal-", "bun-", "sea-", "fl1-", "cs2-", "lol-", "dota")
+
+
 def pick_group(p):
     t = (p.get("category") or "").lower()
-    if any(w in t for w in SPORT_WORDS):
+    slug = (p.get("event_slug") or p.get("slug") or "").lower()
+    title = (p.get("title") or "").lower()
+    if (p.get("is_sports") or any(w in t for w in SPORT_WORDS) or slug.startswith(LEAGUE_PREFIXES)
+            or "o/u " in title or "spread:" in title or "moneyline" in title):
         return "sports"
     if "politic" in t or "election" in t:
         return "politics"
@@ -1175,43 +1234,67 @@ def pct_text(x):
     return "%+.1f%%" % (x * 100)
 
 
-def track_html(tr):
-    if not tr or not tr["total"]:
-        return ("<div class='empty'>No picks logged yet. Results will appear here as the picks play out. "
-                "Every pick is recorded at the price you would have paid.</div>")
-    def row(label, s):
-        if not s:
-            return "<tr><td>%s</td><td colspan='5'>No picks yet</td></tr>" % label
-        wr = "-"
-        be = "-"
-        if s["resolved"]:
-            lo, hi = s["ci"]
-            wr = "%d of %d (%.0f%%, range %.0f-%.0f%%)" % (s["wins"], s["resolved"], 100.0 * s["wins"] / s["resolved"], lo * 100, hi * 100)
-            be = "%.0f%%" % (s["breakeven"] * 100)
-        cls = "pos" if s["avg_ret"] > 0 else "neg"
-        return ("<tr><td><b>%s</b></td><td>%d</td><td>%s</td><td>%s</td><td class='%s'>%s</td><td>%+.1f¢</td></tr>"
-                % (label, s["n"], wr, be, cls, pct_text(s["avg_ret"]), s["avg_move"]))
-    out = ["<table class='tr'><tr><th>Group</th><th>Picks</th><th>Resolved wins</th><th>Win rate needed to break even</th>"
-           "<th>Avg return</th><th>Avg price move</th></tr>",
-           row("Above the line", tr["bet"]), row("Below the line", tr["watch"]), "</table>"]
-    out.append("<table class='tr'><tr><th>Score</th><th>Picks</th><th>Avg return</th><th>Avg price move</th></tr>")
-    for label, s in tr["buckets"]:
-        if s:
-            cls = "pos" if s["avg_ret"] > 0 else "neg"
-            out.append("<tr><td>%s</td><td>%d</td><td class='%s'>%s</td><td>%+.1f¢</td></tr>" % (
-                label, s["n"], cls, pct_text(s["avg_ret"]), s["avg_move"]))
-    out.append("</table>")
-    b = tr["bet"]
-    need = CONFIG["min_resolved_for_verdict"]
-    if not b or b["resolved"] < need:
-        have = b["resolved"] if b else 0
-        out.append("<div class='verdict'><b>Too early to judge.</b> %d of the %d resolved bets needed before this means anything. "
-                   "Open bets are marked at today's price, which can reverse. Keep paper-trading.</div>" % (have, need))
+def track_row(label, s):
+    if not s:
+        return "<tr><td><b>%s</b></td><td colspan='6'>No picks yet</td></tr>" % label
+    wr, be = "-", "-"
+    if s["resolved"]:
+        lo, hi = s["ci"]
+        wr = "%d of %d (%.0f%%, range %.0f-%.0f%%)" % (s["wins"], s["resolved"], 100.0 * s["wins"] / s["resolved"], lo * 100, hi * 100)
+        be = "%.0f%%" % (s["breakeven"] * 100)
+    if s["settled_ret"] is None:
+        settled = "-"
     else:
-        edge = b["wins"] / float(b["resolved"]) - b["breakeven"]
-        out.append("<div class='verdict'>Above-the-line picks have won %.0f%% against a break-even rate of %.0f%% "
-                   "(%+.0f points). Picks in the same event move together, so treat this as less certain than it looks.</div>"
-                   % (100.0 * b["wins"] / b["resolved"], b["breakeven"] * 100, edge * 100))
+        settled = "<span class='%s'>%s</span>" % ("pos" if s["settled_ret"] > 0 else "neg", pct_text(s["settled_ret"]))
+    if s["open_ret"] is None:
+        opened = "-"
+    else:
+        opened = "%d: <span class='%s'>%s</span>" % (s["open"], "pos" if s["open_ret"] > 0 else "neg", pct_text(s["open_ret"]))
+    return ("<tr><td><b>%s</b></td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%+.1f¢</td></tr>"
+            % (label, s["n"], wr, be, settled, opened, s["avg_move"]))
+
+
+TRACK_HEAD = ("<div class='scroll'><table class='tr'><tr><th>Group</th><th>Picks</th><th>Settled wins</th>"
+              "<th>Win rate needed to break even</th><th>Return on settled picks</th><th>Open picks, marked to today</th>"
+              "<th>Avg price move</th></tr>")
+
+
+def track_html(tr):
+    if not tr:
+        return "<div class='empty'>No results yet.</div>"
+    out = []
+    if not tr["total"]:
+        out.append("<div class='empty'>No picks yet under the current rules (version %s). They will appear after the next run.</div>"
+                   % escape(tr.get("engine", "")))
+    else:
+        out.append("<p class='note'>Counting only picks made under rules version %s, since %s. Return is per $1 staked at the price "
+                   "you would have paid; settled picks have a final result, open picks are marked at today's price and can reverse.</p>"
+                   % (escape(tr["engine"]), escape(tr["since"] or "")))
+        out.append(TRACK_HEAD + track_row("Above the line", tr["bet"]) + track_row("Below the line", tr["watch"]) + "</table></div>")
+        out.append("<div class='scroll'><table class='tr'><tr><th>Score</th><th>Picks</th><th>Avg return (settled and open)</th><th>Avg price move</th></tr>")
+        for label, s in tr["buckets"]:
+            if s:
+                out.append("<tr><td>%s</td><td>%d</td><td class='%s'>%s</td><td>%+.1f¢</td></tr>" % (
+                    label, s["n"], "pos" if s["avg_ret"] > 0 else "neg", pct_text(s["avg_ret"]), s["avg_move"]))
+        out.append("</table></div>")
+        b = tr["bet"]
+        need = CONFIG["min_resolved_for_verdict"]
+        if not b or b["resolved"] < need:
+            have = b["resolved"] if b else 0
+            out.append("<div class='verdict'><b>Too early to judge.</b> %d of the %d settled above-the-line picks needed under the "
+                       "current rules before this means anything. Keep paper-trading.</div>" % (have, need))
+        else:
+            edge = b["wins"] / float(b["resolved"]) - b["breakeven"]
+            out.append("<div class='verdict'>Above-the-line picks under the current rules have won %.0f%% against a break-even rate of "
+                       "%.0f%% (%+.0f points) and returned %s on settled picks. Picks in the same event move together, so treat this "
+                       "as less certain than it looks.</div>" % (100.0 * b["wins"] / b["resolved"], b["breakeven"] * 100,
+                                                                 edge * 100, pct_text(b["settled_ret"])))
+    e = tr.get("earlier")
+    if e and e["n"]:
+        out.append("<div class='sec rec'>Earlier rules (reference only)</div>"
+                   "<p class='note'>Picks made before the current rules, when the definition of &quot;above the line&quot; was different. "
+                   "They are not used for the verdict.</p>")
+        out.append(TRACK_HEAD + track_row("Above the line", e["bet"]) + track_row("Below the line", e["watch"]) + "</table></div>")
     return "\n".join(out)
 
 
@@ -1375,7 +1458,8 @@ def render_html(picks, wallets, ctx=None):
     parts.append("</div><div class='tabpane' id='activity'><div class='paneh'>Wallet activity</div>")
     parts.append(activity_html(ctx))
     parts.append("</div><div class='tabpane' id='results'><div class='paneh'>Results</div>"
-                 "<p class='note'>Every pick is saved at the price you would have paid. This is the evidence for whether any of this works.</p>")
+                 "<p class='note'>Every pick is saved at the price you would have paid. This is the evidence for whether any of this works. "
+                 "Only picks made under the current rules (version " + ENGINE_VERSION + ") count toward the verdict.</p>")
     parts.append(track_html(ctx.get("track")))
     parts.append("</div>")
     parts.append(FOOT % (CONFIG["leaderboard_size"], CONFIG["min_windows"], ", ".join(CONFIG["windows"])))
@@ -1501,6 +1585,12 @@ def main():
         print("[debug] wallets with positions: %d, raw candidates: %d, listed: %d" % (len(wallet_positions), len(candidates), len(picks)))
         print("[debug] order books found: %d/%d, dates found: %d/%d, history baseline: %s" % (
             books, len(picks), dated, len(picks), baseline_ts or "none yet"))
+        groups_seen = defaultdict(int)
+        for p in picks:
+            groups_seen[pick_group(p)] += 1
+        print("[debug] pick groups: %s; with a category label: %d/%d, marked as sports by Polymarket: %d" % (
+            ", ".join("%s %d" % kv for kv in sorted(groups_seen.items())) or "none",
+            sum(1 for p in picks if p.get("category")), len(picks), sum(1 for p in picks if p.get("is_sports"))))
         with_stats = sum(1 for a in wallets if stats.get(a))
         print("[debug] wallets with settled-bet stats: %d/%d, category boards loaded: %s, wallets alike (listed picks with fewer independent than raw): %d" % (
             with_stats, len(wallets), ", ".join(sorted(_CAT_BOARDS)) or "none",
