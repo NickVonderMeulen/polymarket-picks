@@ -3,15 +3,16 @@
 Polymarket smart-money tracker, v2 (READ-ONLY, places no orders).
 
 Each run:
-  1. Finds top traders: wallets ranked in the top N on the leaderboard in several time windows.
+  1. Finds top traders: a wide net from the leaderboard (top 100 by profit this month and all time), drops market
+     makers (two-sided books, very high volume, near-certain bets), and ranks the rest by settled-bet edge.
   2. Reads their open positions and groups them by market + side.
   3. Scores every candidate 0-100 (Stage A) on seven signals:
         trader quality 15 | wallet agreement 20 | entry price vs theirs 15 | recent buying 15
         conviction 10 | low opposition 10 | execution quality 15
      then applies hard safety filters (Stage B). A pick is ABOVE THE LINE only if it passes every
      filter and scores at least the cutoff. Everything else is listed below the line with the reasons.
-  4. Uses the real order book to get the price you would actually pay (plus Polymarket's taker fee),
-     the spread and the available liquidity.
+  4. Uses the real order book to model a resting limit buy (no taker fee) with a price ceiling near their entry,
+     and the spread and available liquidity. If the market has already moved past the ceiling, the pick fails.
   5. Compares with earlier snapshots of the wallets' positions to see who is adding, trimming or has exited.
   6. Drops picks that are the same event as a higher-ranked pick, and caps total suggested exposure.
   7. Logs every pick at the price you would have paid, then tracks how they turned out
@@ -54,17 +55,27 @@ CLOB_API = "https://clob.polymarket.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Change this whenever you change the scoring or the rules. Picks are stamped with it, and the Results verdict
 # counts only picks made under the current version, so every rule set gets its own clean paper-trade sample.
-ENGINE_VERSION = "2.2"
+ENGINE_VERSION = "2.3"
 DB_PATH = os.environ.get("DB_PATH", os.path.join(HERE, "picks.db"))
 REPORT_PATH = os.path.join(HERE, "report.html")
 
 # ---------------- Settings you can tune ----------------
 CONFIG = {
     # Who to follow
-    "windows": ["week", "month", "all"],
-    "leaderboard_size": 40,        # top N per window
-    "min_windows": 2,              # wallet must be top-N in this many windows
-    "max_wallets": 30,
+    # Wallets come from a wide net (top N by profit this month and all time), are screened for market makers,
+    # then ranked by settled-bet edge, not by raw profit.
+    "windows": ["month", "all"],
+    "leaderboard_size": 100,       # top N per window
+    "min_windows": 1,              # wallet must be top-N in this many windows to enter the screening pool
+    "screen_pool": 60,             # wallets whose settled history is checked
+    "max_wallets": 30,             # wallets followed after screening
+    "min_settled_bets": 20,        # settled bets needed before a wallet counts as proven
+    "min_proven_wallets": 8,       # below this many proven wallets, unproven ones fill the list
+    "max_two_sided_frac": 0.15,    # drop wallets that held both sides in more than this share of their markets
+    "max_settled_positions": 500,  # drop wallets with more settled positions than this (high-frequency; trades are even more)
+    "high_price": 0.93,            # entries at or above this are near-certain bets
+    "max_high_price_frac": 0.50,   # drop wallets whose bets are mostly near-certain (liquidity farming at 93c+)
+    "hedge_ratio": 0.10,           # a wallet holding both sides of a market, smaller side at least this share, is hedged
     "positions_limit": 200,
     # What counts as a candidate
     "min_position_usd": 100,       # ignore small positions when forming a pick
@@ -77,7 +88,7 @@ CONFIG = {
     "min_wallets_bet": 2,
     "min_price": 0.10,             # what you would actually pay, fee included
     "max_price": 0.85,
-    "max_drift": 0.08,             # you may not pay more than 8c over their average entry
+    "max_drift": 0.03,             # limit price ceiling: never more than 3c over their average entry
     "max_opposition_ratio": 0.35,  # top-wallet money on the other side vs agreeing money
     "max_spread": 0.06,            # best ask minus best bid
     "min_depth_multiple": 3.0,     # shares for sale within 3c of the best ask must cover this many stakes
@@ -103,7 +114,9 @@ CONFIG = {
     "skill_prior": 30,             # settled bets needed before a wallet's record counts fully
     "skill_refresh_days": 3,       # settled-bet stats are cached this long
     "unknown_skill": 0.40,         # a wallet with no settled history counts as unproven: below a good record
-    "skill_refresh_per_run": 12,   # wallets refreshed per run, so one run never makes hundreds of calls
+    "skill_refresh_per_run": 30,   # wallets refreshed per run, so one run never makes hundreds of calls
+    "conviction_full_x": 5.0,      # a bet this many times the wallet's median bet earns full conviction points
+    "conviction_unknown": 0.25,    # share of conviction points when the wallet's usual bet size is unknown
     "independence_overlap": 0.6,   # wallets sharing this much of their bets are treated as one strategy
     "independence_min_positions": 5,
     "categories": ["sports", "politics", "crypto", "economics"],
@@ -191,16 +204,42 @@ def now_local():
 
 # ---------------- Step 1: pick wallets ----------------
 def fetch_leaderboard(window):
-    resp = get_json(DATA_API, "/v2/leaderboard", {
-        "category": "overall",
-        "time_period": window,   # day / week / month / all
-        "sort_by": "PNL",
-        "limit": CONFIG["leaderboard_size"],
-    })
-    return rows_of(resp)
+    last = None
+    for size in dict.fromkeys([CONFIG["leaderboard_size"], 50, 40]):   # fall back if the API caps the page size
+        try:
+            resp = get_json(DATA_API, "/v2/leaderboard", {
+                "category": "overall",
+                "time_period": window,   # day / week / month / all
+                "sort_by": "PNL",
+                "limit": size,
+            })
+            return rows_of(resp)
+        except Exception as e:
+            last = e
+    raise last
 
 
-def choose_wallets():
+def shrunk_edge(st):
+    """Win rate minus the win rate their entry prices implied, pulled toward zero for small samples."""
+    n = st["n"]
+    return (st["win_rate"] - st["implied"]) * n / float(n + CONFIG["skill_prior"])
+
+
+def wallet_flag(st):
+    """Reason to drop a wallet as a market maker or farmer rather than a directional trader, or ''."""
+    if st.get("two_sided") is not None and st["two_sided"] > CONFIG["max_two_sided_frac"]:
+        return "holds both sides in %.0f%% of its markets (market maker)" % (st["two_sided"] * 100)
+    if (st.get("positions") or 0) > CONFIG["max_settled_positions"]:
+        return "%d settled positions (high-frequency)" % st["positions"]
+    if st.get("hi_price") is not None and st["hi_price"] > CONFIG["max_high_price_frac"]:
+        return "%.0f%% of bets entered at %.0fc or more (liquidity farming)" % (st["hi_price"] * 100, CONFIG["high_price"] * 100)
+    return ""
+
+
+_SCREEN = {}
+
+
+def choose_wallets(con=None):
     appearances = defaultdict(lambda: {"windows": set(), "name": "", "pnl": 0.0, "best_rank": None})
     for w in CONFIG["windows"]:
         for idx, row in enumerate(fetch_leaderboard(w), 1):
@@ -216,7 +255,41 @@ def choose_wallets():
         time.sleep(CONFIG["pause_seconds"])
     kept = {k: v for k, v in appearances.items() if len(v["windows"]) >= CONFIG["min_windows"]}
     ranked = sorted(kept.items(), key=lambda kv: (-len(kv[1]["windows"]), -kv[1]["pnl"]))
-    return dict(ranked[: CONFIG["max_wallets"]])
+    if con is None:
+        return dict(ranked[: CONFIG["max_wallets"]])
+    return screen_wallets(con, dict(ranked[: CONFIG["screen_pool"]]))
+
+
+def screen_wallets(con, pool):
+    """Drop market makers and farmers, then rank what is left by settled-bet edge instead of raw profit."""
+    stats = ensure_wallet_stats(con, pool)
+    proven, unproven, dropped = [], [], []
+    for addr in pool:                       # pool order = leaderboard standing
+        st = stats.get(addr)
+        if not st:
+            unproven.append(addr)           # no settled history found (yet)
+            continue
+        flag = wallet_flag(st)
+        if flag:
+            dropped.append((pool[addr]["name"], flag))
+        elif st["n"] < CONFIG["min_settled_bets"]:
+            unproven.append(addr)
+        elif st["roi"] <= 0 or shrunk_edge(st) <= 0:
+            dropped.append((pool[addr]["name"], "no edge on %d settled bets (return %+.0f%%, win rate %.0f%% vs %.0f%% implied)" % (
+                st["n"], st["roi"] * 100, st["win_rate"] * 100, st["implied"] * 100)))
+        else:
+            proven.append((skill_score(st), addr))
+    proven.sort(key=lambda x: -x[0])
+    chosen = [a for _, a in proven[: CONFIG["max_wallets"]]]
+    filled = 0
+    if len(chosen) < CONFIG["min_proven_wallets"]:
+        for a in unproven:
+            if len(chosen) >= CONFIG["max_wallets"]:
+                break
+            chosen.append(a)
+            filled += 1
+    _SCREEN.update({"pool": len(pool), "proven": len(proven), "unproven": len(unproven), "dropped": dropped, "filled": filled})
+    return {a: pool[a] for a in chosen}
 
 
 def board_standing(info):
@@ -287,9 +360,12 @@ def fetch_status_rows(addr, status):
 
 
 def wallet_track(rows):
-    """Skill stats from settled positions: count, win rate, return on money put in, and the win rate their prices implied."""
+    """Skill stats from settled positions: count, win rate, return on money put in, the win rate their prices implied,
+    plus market-maker tells (both sides held, position count, near-certain entries) and their median bet size."""
     n = wins = 0
     cost_sum = pnl_sum = implied_sum = 0.0
+    costs, hi = [], 0
+    sides = defaultdict(set)
     for r in rows:
         avg = num(field(r, "avg_price", "avgPrice"), 0.5)
         cost = num(field(r, "entry_cost_usdc", "entryCostUsdc", "initialValue"))
@@ -307,9 +383,22 @@ def wallet_track(rows):
         cost_sum += cost
         pnl_sum += pnl
         implied_sum += clamp(avg)
+        costs.append(cost)
+        hi += 1 if avg >= CONFIG["high_price"] else 0
+        cond = field(r, "condition_id", "conditionId")
+        side = field(r, "outcome", "token_id", "asset", "asset_id")
+        if cond and side is not None:
+            sides[cond].add(str(side))
     if n == 0:
         return None
-    return {"n": n, "wins": wins, "roi": pnl_sum / cost_sum, "win_rate": wins / float(n), "implied": implied_sum / n}
+    costs.sort()
+    med = costs[n // 2] if n % 2 else (costs[n // 2 - 1] + costs[n // 2]) / 2.0
+    return {"n": n, "wins": wins, "roi": pnl_sum / cost_sum, "win_rate": wins / float(n), "implied": implied_sum / n,
+            "positions": len(rows), "med_cost": med, "hi_price": hi / float(n),
+            "two_sided": (sum(1 for v in sides.values() if len(v) >= 2) / float(len(sides))) if sides else None}
+
+
+STAT_COLS = ("n", "wins", "roi", "win_rate", "implied", "positions", "med_cost", "hi_price", "two_sided")
 
 
 def ensure_wallet_stats(con, wallets):
@@ -317,11 +406,11 @@ def ensure_wallet_stats(con, wallets):
     out, stale = {}, []
     cutoff = datetime.now(timezone.utc) - timedelta(days=CONFIG["skill_refresh_days"])
     for addr in wallets:
-        r = con.execute("SELECT ts, n, wins, roi, win_rate, implied FROM wallet_stats WHERE wallet = ?", (addr,)).fetchone()
+        r = con.execute("SELECT ts, %s FROM wallet_stats WHERE wallet = ?" % ", ".join(STAT_COLS), (addr,)).fetchone()
         if r:
-            out[addr] = ({"n": r["n"], "wins": r["wins"], "roi": r["roi"], "win_rate": r["win_rate"],
-                          "implied": r["implied"]} if r["n"] else None)
-        if r is None or datetime.fromisoformat(r["ts"]) < cutoff:
+            out[addr] = {k: r[k] for k in STAT_COLS} if r["n"] else None
+        # never looked up, cached by an older version (no position count), or past the refresh age
+        if r is None or r["positions"] is None or datetime.fromisoformat(r["ts"]) < cutoff:
             stale.append((addr, r is not None))
     stale.sort(key=lambda x: x[1])   # wallets never looked up come first
     failed = 0
@@ -336,9 +425,10 @@ def ensure_wallet_stats(con, wallets):
             if failed <= 2:
                 print("no settled-bet history for", addr[:10], str(e)[:90])
             continue
-        con.execute("INSERT OR REPLACE INTO wallet_stats(wallet, ts, n, wins, roi, win_rate, implied) VALUES (?,?,?,?,?,?,?)",
-                    (addr, datetime.now(timezone.utc).isoformat(), st["n"] if st else 0, st["wins"] if st else 0,
-                     st["roi"] if st else 0.0, st["win_rate"] if st else 0.0, st["implied"] if st else 0.0))
+        vals = [st[k] for k in STAT_COLS] if st else [0, 0, 0.0, 0.0, 0.0, 0, None, None, None]
+        con.execute("INSERT OR REPLACE INTO wallet_stats(wallet, ts, %s) VALUES (?,?,%s)" % (
+            ", ".join(STAT_COLS), ",".join("?" * len(STAT_COLS))),
+            (addr, datetime.now(timezone.utc).isoformat()) + tuple(vals))
         out[addr] = st
         time.sleep(CONFIG["pause_seconds"])
     con.commit()
@@ -432,13 +522,14 @@ def analyze_book(book, ref_stake):
     bids = sorted(((num(b.get("price")), num(b.get("size"))) for b in (book.get("bids") or [])
                    if num(b.get("size")) > 0), key=lambda x: -x[0])
     out = {"ask": None, "bid": bids[0][0] if bids else None, "spread": None, "depth": 0.0, "exec_price": None,
-           "min_size": num(book.get("min_order_size"))}
+           "min_size": num(book.get("min_order_size")), "tick": num(book.get("tick_size"), 0.01) or 0.01, "mid": None}
     if not asks:
         return out
     best = asks[0][0]
     out["ask"] = best
     if bids:
         out["spread"] = best - bids[0][0]
+        out["mid"] = (best + bids[0][0]) / 2.0
     out["depth"] = sum(pr * sz for pr, sz in asks if pr <= best + 0.03)
     remaining, cost, shares = ref_stake, 0.0, 0.0
     for pr, sz in asks:
@@ -580,15 +671,22 @@ def independent_count(addrs, sides_of):
 # ---------------- Step 4: candidates, scoring, safety filters ----------------
 def build_candidates(wallet_positions, baseline):
     groups = defaultdict(lambda: {
-        "title": "", "outcome": "", "slug": "", "wallets": {}, "shares_by": {},
+        "title": "", "outcome": "", "slug": "", "wallets": {}, "shares_by": {}, "cost_by": {},
         "cur_price": 0.0, "cost_total": 0.0, "shares_total": 0.0, "token_id": "", "end": "",
     })
     side_money = defaultdict(lambda: defaultdict(float))
     sides_of = defaultdict(set)
-    wallet_total = {}
+    # A wallet holding both sides of a market is quoting or hedging, not making a directional bet: skip those markets.
+    hedged = {}
     for addr, info in wallet_positions.items():
-        wallet_total[addr] = sum(num(field(p, "current_value", "currentValue", default=0))
-                                 for p in info["positions"] if not (p.get("redeemable") or p.get("mergeable")))
+        legs = defaultdict(dict)
+        for p in info["positions"]:
+            cond = field(p, "condition_id", "conditionId")
+            if not cond or p.get("outcome") is None or p.get("redeemable") or p.get("mergeable"):
+                continue
+            legs[cond][p["outcome"]] = legs[cond].get(p["outcome"], 0.0) + num(field(p, "current_value", "currentValue", default=0))
+        hedged[addr] = {c for c, d in legs.items()
+                        if len(d) >= 2 and sorted(d.values())[-2] >= CONFIG["hedge_ratio"] * max(d.values())}
 
     for addr, info in wallet_positions.items():
         for p in info["positions"]:
@@ -597,6 +695,8 @@ def build_candidates(wallet_positions, baseline):
             if not cond or outcome is None:
                 continue
             if p.get("redeemable") or p.get("mergeable"):   # already resolved
+                continue
+            if cond in hedged[addr]:
                 continue
             shares = num(field(p, "current_size", "size", default=0))
             value = num(field(p, "current_value", "currentValue", default=0))
@@ -612,6 +712,10 @@ def build_candidates(wallet_positions, baseline):
             g["end"] = field(p, "end_date", "endDate", default=g["end"])
             g["cur_price"] = num(field(p, "cur_price", "curPrice", "current_price"), value / shares)
             g["cost_total"] += shares * num(field(p, "avg_price", "avgPrice", default=0))
+            paid = num(field(p, "entry_cost_usdc", "entryCostUsdc"))
+            if paid <= 0:
+                paid = shares * num(field(p, "avg_price", "avgPrice", default=0))
+            g["cost_by"][addr] = g["cost_by"].get(addr, 0.0) + paid
             g["shares_total"] += shares
             g["wallets"][addr] = g["wallets"].get(addr, 0.0) + value
             g["shares_by"][addr] = g["shares_by"].get(addr, 0.0) + shares
@@ -630,7 +734,10 @@ def build_candidates(wallet_positions, baseline):
         agree = sum(g["wallets"].values())
         oppose = sum(m for o, m in side_money[cond].items() if o != outcome)
         quality = (sum(wallet_positions[a]["quality"] * v for a, v in g["wallets"].items()) / agree) if agree else 0.5
-        convs = [v / wallet_total[a] for a, v in g["wallets"].items() if wallet_total.get(a, 0) > 0]
+        # Conviction = this bet's cost as a multiple of the wallet's own median settled bet (not a share of open positions,
+        # which ignores idle cash and punishes wallets that spread across many markets).
+        convs = [min(c / wallet_positions[a]["med_cost"], 20.0) for a, c in g["cost_by"].items()
+                 if (wallet_positions[a].get("med_cost") or 0) > 0]
         flow = compute_flow(g, cond, outcome, baseline, base_by_side, baseline_wallets, wallet_positions) if baseline else None
         picks.append({
             "condition_id": cond, "title": g["title"], "outcome": outcome, "slug": g["slug"],
@@ -638,10 +745,10 @@ def build_candidates(wallet_positions, baseline):
             "agree_money": agree, "oppose_money": oppose,
             "opp_ratio": oppose / agree if agree else 1.0,
             "avg_entry": g["cost_total"] / g["shares_total"], "mid": g["cur_price"],
-            "quality": quality, "conviction": (sum(convs) / len(convs)) if convs else 0.0, "flow": flow,
+            "quality": quality, "conviction": (sum(convs) / len(convs)) if convs else None, "flow": flow,
             "holders": sorted(g["wallets"].items(), key=lambda kv: -kv[1]),
             "token_id": g["token_id"], "start": "", "end": g["end"], "category": "", "fee_rate": DEFAULT_FEE_RATE,
-            "book": None, "exec_price": None, "all_in": None,
+            "book": None, "exec_price": None, "all_in": None, "limit": None, "limit_ceiling": None, "fillable": True,
             "tier": "watch", "why": [], "parts": {}, "score": 0.0, "drift": 0.0,
             "stake": None, "stake_pct": None, "capped": False,
             "specialty": "", "specialists": 0, "specialist_share": 0.0, "min_order_usd": None, "min_over_cap": False,
@@ -654,8 +761,30 @@ def ref_stake():
 
 
 def entry_price(p):
-    """What you would actually pay per share (order book plus fee) if we have it, otherwise the midpoint."""
+    """The limit price we model: a resting buy just above the best bid (no taker fee), capped near their entry.
+    Without a usable order book, the midpoint."""
+    if p.get("limit") is not None:
+        return p["limit"]
     return p["all_in"] if p.get("all_in") else p["mid"]
+
+
+def set_limit(p):
+    """Maker execution: rest a buy one tick above the best bid instead of crossing the spread and paying the taker fee.
+    The ceiling is their average entry plus max_drift, and never above the midpoint. If the best bid is already over the
+    ceiling, there is no price near their entry where an order would fill, so the pick fails."""
+    b = p.get("book")
+    if not b or b["bid"] is None:
+        return
+    tick, bid, ask = b["tick"], b["bid"], b["ask"]
+    maker = bid + tick
+    if ask is not None and maker >= ask - 1e-9:
+        maker = bid                      # spread is a single tick: join the bid instead of crossing
+    ref_mid = b["mid"] if b["mid"] is not None else p["mid"]
+    ceiling = min(p["avg_entry"] + CONFIG["max_drift"], ref_mid)
+    ceiling = round(math.floor(ceiling / tick + 1e-9) * tick, 4)
+    p["limit_ceiling"] = ceiling
+    p["limit"] = round(min(maker, ceiling), 4)
+    p["fillable"] = ceiling >= bid - 1e-9
 
 
 def buying_fraction(flow):
@@ -686,9 +815,10 @@ def assess(p):
     parts = {
         "agreement": W["agreement"] * min(p.get("eff_wallets", p["wallets"]), 6) / 6.0,
         "quality": W["quality"] * clamp(p["quality"] + C["category_bonus"] * p.get("specialist_share", 0.0)),
-        "entry": W["entry"] * (1 - clamp(max(drift, 0) / 0.15)),
+        "entry": W["entry"] * (1 - clamp(max(drift, 0) / (2 * C["max_drift"]))),
         "buying": W["buying"] * buying_fraction(p["flow"]),
-        "conviction": W["conviction"] * clamp(p["conviction"] / 0.10),
+        "conviction": W["conviction"] * (C["conviction_unknown"] if p["conviction"] is None
+                                         else clamp((p["conviction"] - 0.5) / (C["conviction_full_x"] - 0.5))),
         "opposition": W["opposition"] * (1 - clamp(p["opp_ratio"])),
         "execution": W["execution"] * execution_fraction(p),
     }
@@ -702,8 +832,12 @@ def assess(p):
         why.append("you would pay %.0fc, a longshot" % (price * 100))
     if price > C["max_price"]:
         why.append("you would pay %.0fc, leaving little upside" % (price * 100))
-    if drift > C["max_drift"]:
-        why.append("you would pay %.0fc more than their average entry" % (drift * 100))
+    if p.get("limit") is not None:
+        if not p.get("fillable", True):
+            why.append("the best buy order is already %s, above the %s limit ceiling (their entry + %.0fc): the price has moved, do not chase" % (
+                cents(p["book"]["bid"]), cents(p["limit_ceiling"]), C["max_drift"] * 100))
+    elif drift > C["max_drift"]:
+        why.append("the price is %.0fc above their average entry" % (drift * 100))
     if p["opp_ratio"] > C["max_opposition_ratio"]:
         why.append("top wallets on the other side hold %.0f%% as much" % (p["opp_ratio"] * 100))
     b = p.get("book")
@@ -762,9 +896,11 @@ def enrich(p):
             if book["exec_price"] is not None:
                 ep = book["exec_price"]
                 p["exec_price"] = ep
-                p["all_in"] = ep + p["fee_rate"] * ep * (1 - ep)
-                if book["min_size"] > 0:
-                    p["min_order_usd"] = book["min_size"] * ep
+                p["all_in"] = ep + p["fee_rate"] * ep * (1 - ep)   # what crossing the spread would cost: kept as a reference
+            set_limit(p)
+            ref = p.get("limit") or p.get("exec_price")
+            if book["min_size"] > 0 and ref:
+                p["min_order_usd"] = book["min_size"] * ref
         except Exception:
             pass
         time.sleep(CONFIG["pause_seconds"])
@@ -853,6 +989,10 @@ def db():
     con.execute("CREATE INDEX IF NOT EXISTS idx_snap_ts ON snapshots(ts)")
     con.execute("""CREATE TABLE IF NOT EXISTS wallet_stats (
         wallet TEXT PRIMARY KEY, ts TEXT, n INTEGER, wins INTEGER, roi REAL, win_rate REAL, implied REAL)""")
+    have_ws = {r[1] for r in con.execute("PRAGMA table_info(wallet_stats)")}
+    for name, typ in (("positions", "INTEGER"), ("med_cost", "REAL"), ("hi_price", "REAL"), ("two_sided", "REAL")):
+        if name not in have_ws:
+            con.execute("ALTER TABLE wallet_stats ADD COLUMN %s %s" % (name, typ))
     con.commit()
     return con
 
@@ -872,7 +1012,8 @@ def log_picks(con, picks):
                  p["all_in"], p["score"], p["slug"], p["end"], now if bet else None, price if bet else None, ENGINE_VERSION))
         else:
             if bet and not row["bet_at"]:
-                con.execute("UPDATE picks SET bet_at = ?, bet_price = ? WHERE id = ?", (now, price, row["id"]))
+                con.execute("UPDATE picks SET bet_at = ?, bet_price = ?, exec_price = COALESCE(?, exec_price) WHERE id = ?",
+                            (now, price, p["all_in"], row["id"]))
             con.execute("UPDATE picks SET tier = ?, last_score = ?, wallets = ?, slug = ?, end_date = ? WHERE id = ?",
                         (p["tier"], p["score"], p["wallets"], p["slug"], p["end"], row["id"]))
     con.commit()
@@ -903,6 +1044,8 @@ def summarize(items):
         "avg_ret": sum(i["cur"] / i["entry"] - 1 for i in items) / len(items),
         "settled_ret": avg([i["cur"] / i["entry"] - 1 for i in res]),
         "open_ret": avg([i["cur"] / i["entry"] - 1 for i in opn]),
+        "settled_ret_taker": avg([i["cur"] / i["taker"] - 1 for i in res if i.get("taker")]),
+        "open_ret_taker": avg([i["cur"] / i["taker"] - 1 for i in opn if i.get("taker")]),
         "avg_move": sum((i["cur"] - i["entry"]) * 100 for i in items) / len(items),
         "breakeven": (sum(i["entry"] for i in res) / len(res)) if res else None,
         "ci": wilson(wins, len(res)) if res else None,
@@ -945,7 +1088,9 @@ def track_record(con, refresh=True):
         cur = r["final_price"] if r["resolved"] else r["last_price"]
         if not entry or entry < 0.02 or cur is None:
             continue
-        item = {"entry": entry, "cur": cur, "resolved": bool(r["resolved"]), "score": r["last_score"] or 0.0}
+        item = {"entry": entry, "cur": cur, "resolved": bool(r["resolved"]), "score": r["last_score"] or 0.0,
+                "taker": (r["exec_price"] if (is_bet and r["engine"] == ENGINE_VERSION and r["exec_price"]
+                                              and r["exec_price"] >= 0.02) else None)}
         if r["engine"] == ENGINE_VERSION:
             (bets if is_bet else watch).append(item)
             all_items.append(item)
@@ -1148,7 +1293,15 @@ def when_info(p):
 
 
 def cents(x):
-    return "%.0f¢" % (x * 100)
+    v = x * 100
+    return "%.0f¢" % v if abs(v - round(v)) < 0.05 else "%.1f¢" % v
+
+
+def conviction_text(p):
+    x = p.get("conviction")
+    if x is None:
+        return "Their usual bet size is not known yet, so conviction is not scored."
+    return "Bet size averages %.1fx these wallets' own median bet." % x
 
 
 def flow_line(p, ctx):
@@ -1170,8 +1323,15 @@ def exec_line(p):
         return "No order-book data: price shown is the midpoint, so the real price may be a little higher"
     if b["exec_price"] is None:
         return "Order book: not enough shares for sale to fill a $%.2f order" % ref_stake()
-    fee = (p["all_in"] - p["exec_price"]) * 100
     sp = "n/a" if b["spread"] is None else "%.0f¢" % (b["spread"] * 100)
+    if p.get("limit") is not None:
+        extra = (" Buying at the ask instead would cost %s all-in, %.1f¢ more." % (cents(p["all_in"]), (p["all_in"] - p["limit"]) * 100)
+                 if p.get("all_in") else "")
+        return ("Order book: best buy %s, best sell %s, spread %s. Rest a limit buy at %s, never above %s (no taker fee).%s "
+                "If it does not fill near their entry, skip it." % (
+                    cents(b["bid"]), cents(b["ask"]) if b["ask"] is not None else "n/a", sp, cents(p["limit"]),
+                    cents(p["limit_ceiling"]), extra))
+    fee = (p["all_in"] - p["exec_price"]) * 100
     return "Order book: you would pay %s per share, about %.1f¢ more with the taker fee; spread %s; %s for sale within 3¢" % (
         cents(p["exec_price"]), fee, sp, money(b["depth"]))
 
@@ -1185,8 +1345,12 @@ def card(i, p, wallets):
     when_td = ("<td><div class='l'>%s</div><div class='v'>%s</div><div class='holders' style='margin:0'>%s</div></td>"
                % (wi[0], escape(wi[1]), escape(wi[2]))) if wi else ""
     price = entry_price(p)
-    pay_sub = ("with fee, from order book" if p.get("all_in")
-               else ("midpoint; order book too thin to fill" if p.get("book") else "midpoint, no order book"))
+    if p.get("limit") is not None:
+        pay_label, pay_sub = "Limit buy at", "never above %s; resting order, no taker fee" % cents(p["limit_ceiling"])
+    else:
+        pay_label = "You would pay"
+        pay_sub = ("with fee, from order book" if p.get("all_in")
+                   else ("midpoint; order book too thin to fill" if p.get("book") else "midpoint, no order book"))
     drift_cls = "neg" if p["drift"] > CONFIG["max_drift"] else ("pos" if p["drift"] <= 0.02 else "")
     parts = " · ".join("%s %.0f/%d" % (label, p["parts"][k], CONFIG["weights"][k]) for k, label in WEIGHT_LABELS)
     indep_note = (" (only %d independent)" % p["eff_wallets"]) if p.get("eff_wallets", p["wallets"]) < p["wallets"] else ""
@@ -1216,13 +1380,13 @@ def card(i, p, wallets):
             pill_class(p["score"], p["tier"]), p["score"]) +
         "<table class='facts'><tr>" +
         "<td><div class='l'>Side</div><div class='v'><span class='side'>%s</span></div></td>" % escape(p["outcome"]) +
-        "<td><div class='l'>You would pay</div><div class='v'>%s</div><div class='holders' style='margin:0'>%s</div></td>" % (
-            cents(price), pay_sub) +
+        "<td><div class='l'>%s</div><div class='v'>%s</div><div class='holders' style='margin:0'>%s</div></td>" % (
+            pay_label, cents(price), pay_sub) +
         "<td><div class='l'>Their avg entry</div><div class='v'>%s</div></td>" % cents(p["avg_entry"]) +
         "<td><div class='l'>Drift</div><div class='v %s'>%+.0f¢</div></td>" % (drift_cls, p["drift"] * 100) +
         when_td + "</tr></table>" +
-        "<div class='line2'><b>%d</b> top wallets agree%s with %s; %s on the other side. Avg %.0f%% of each wallet's portfolio is in it.</div>" % (
-            p["wallets"], indep_note, money(p["agree_money"]), money(p["oppose_money"]), p["conviction"] * 100) +
+        "<div class='line2'><b>%d</b> top wallets agree%s with %s; %s on the other side. %s</div>" % (
+            p["wallets"], indep_note, money(p["agree_money"]), money(p["oppose_money"]), conviction_text(p)) +
         "<div class='sig'>%s</div><div class='sig'>%s</div>" % (escape(flow_line(p, None)), escape(exec_line(p))) +
         spec_line +
         "<div class='holders'>Biggest: %s</div>" % holders +
@@ -1246,10 +1410,14 @@ def track_row(label, s):
         settled = "-"
     else:
         settled = "<span class='%s'>%s</span>" % ("pos" if s["settled_ret"] > 0 else "neg", pct_text(s["settled_ret"]))
+        if s.get("settled_ret_taker") is not None:
+            settled += "<br><small>crossing the spread: %s</small>" % pct_text(s["settled_ret_taker"])
     if s["open_ret"] is None:
         opened = "-"
     else:
         opened = "%d: <span class='%s'>%s</span>" % (s["open"], "pos" if s["open_ret"] > 0 else "neg", pct_text(s["open_ret"]))
+        if s.get("open_ret_taker") is not None:
+            opened += "<br><small>crossing the spread: %s</small>" % pct_text(s["open_ret_taker"])
     return ("<tr><td><b>%s</b></td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%+.1f¢</td></tr>"
             % (label, s["n"], wr, be, settled, opened, s["avg_move"]))
 
@@ -1268,7 +1436,9 @@ def track_html(tr):
                    % escape(tr.get("engine", "")))
     else:
         out.append("<p class='note'>Counting only picks made under rules version %s, since %s. Return is per $1 staked at the price "
-                   "you would have paid; settled picks have a final result, open picks are marked at today's price and can reverse.</p>"
+                   "you would have paid; settled picks have a final result, open picks are marked at today's price and can reverse. "
+                   "The main figure assumes your limit order filled at the limit price. Real limit orders miss some trades, often the ones "
+                   "that ran away, so the truth sits between it and the smaller &quot;crossing the spread&quot; figure (ask price plus taker fee).</p>"
                    % (escape(tr["engine"]), escape(tr["since"] or "")))
         out.append(TRACK_HEAD + track_row("Above the line", tr["bet"]) + track_row("Below the line", tr["watch"]) + "</table></div>")
         out.append("<div class='scroll'><table class='tr'><tr><th>Score</th><th>Picks</th><th>Avg return (settled and open)</th><th>Avg price move</th></tr>")
@@ -1411,11 +1581,13 @@ def page_head(picks, wallets, ctx):
     ]
 
 
-FOOT = ("<div class='foot'>Following wallets in the top %d on the leaderboard in at least %d of these windows: %s. "
+FOOT = ("<div class='foot'>Wallets come from the top %d by profit in at least %d of these windows: %s. Market makers (two-sided books, "
+        "very high volume, near-certain bets) are dropped, and the rest are ranked by settled-bet edge, not raw profit. "
         "Score = trader quality (15) + wallet agreement (20, wallets that trade alike count once) + entry price (15) + recent buying (15) + "
-        "conviction (10) + low opposition (10) + execution (15). These weights are starting guesses, not proven settings. "
-        "Fees use Polymarket's published taker rates by category. Not financial advice. Copying means worse prices than the "
-        "original traders, and no ranking guarantees profit.</div>")
+        "conviction (10, bet size vs the wallet's own median bet) + low opposition (10) + execution (15). These weights are starting guesses, "
+        "not proven settings. Prices are resting limit buys (no taker fee), never more than 3c above their entry; if the market has moved past "
+        "that, the pick is below the line. Not financial advice. Copying means worse prices than the original traders, and no ranking "
+        "guarantees profit.</div>")
 
 TAB_JS = r"""<script>
 (function(){
@@ -1538,8 +1710,14 @@ def main():
         return
 
     baseline_ts, baseline, base_meta = load_baseline(con)
-    wallets = choose_wallets()
+    wallets = choose_wallets(con)
     print("Following %d wallets" % len(wallets))
+    if _SCREEN:
+        print("Screened %d wallets: %d proven, %d too little history, %d dropped%s" % (
+            _SCREEN["pool"], _SCREEN["proven"], _SCREEN["unproven"], len(_SCREEN["dropped"]),
+            (", %d unproven added to fill the list" % _SCREEN["filled"]) if _SCREEN["filled"] else ""))
+        for name, why in _SCREEN["dropped"][:8]:
+            print("  dropped %s: %s" % (str(name)[:20], why))
     stats = ensure_wallet_stats(con, wallets)
     have_stats = any(stats.get(a) for a in wallets)
     _CAT_BOARDS.update(fetch_category_boards())
@@ -1548,6 +1726,7 @@ def main():
         try:
             rows, truncated = fetch_positions(addr)
             wallet_positions[addr] = {"name": info["name"], "positions": rows, "truncated": truncated,
+                                      "med_cost": (stats.get(addr) or {}).get("med_cost"),
                                       "quality": wallet_quality(info, stats.get(addr), CONFIG["unknown_skill"] if have_stats else None)}
         except Exception as e:
             print("skip", addr[:10], e)
