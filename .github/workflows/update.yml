@@ -30,6 +30,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           BANKROLL: ${{ vars.BANKROLL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then EMAIL="--email"; else EMAIL=""; fi
           python polytracker.py $EMAIL --out docs/index.html --db data/picks.db
