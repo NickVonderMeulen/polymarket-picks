@@ -11,7 +11,9 @@ Each run:
         conviction 10 | low opposition 10 | execution quality 15
      then applies hard safety filters (Stage B). A pick is ABOVE THE LINE only if it passes every
      filter and scores at least the cutoff. Everything else is listed below the line with the reasons.
-  4. Uses the real order book to model a resting limit buy (no taker fee) with a price ceiling near their entry,
+  4. Cross-checks NFL and NBA picks against sportsbook odds (The Odds API, vig removed): a pick is only a bet when the
+     books think it is underpriced by at least 3 cents. Other markets cannot be verified and stay below the line.
+  4b. Uses the real order book to model a resting limit buy (no taker fee) with a price ceiling near their entry,
      and the spread and available liquidity. If the market has already moved past the ceiling, the pick fails.
   5. Compares with earlier snapshots of the wallets' positions to see who is adding, trimming or has exited.
   6. Drops picks that are the same event as a higher-ranked pick, and caps total suggested exposure.
@@ -42,6 +44,7 @@ import smtplib
 import sqlite3
 import ssl
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -55,7 +58,7 @@ CLOB_API = "https://clob.polymarket.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Change this whenever you change the scoring or the rules. Picks are stamped with it, and the Results verdict
 # counts only picks made under the current version, so every rule set gets its own clean paper-trade sample.
-ENGINE_VERSION = "2.3"
+ENGINE_VERSION = "2.4"
 DB_PATH = os.environ.get("DB_PATH", os.path.join(HERE, "picks.db"))
 REPORT_PATH = os.path.join(HERE, "report.html")
 
@@ -70,9 +73,9 @@ CONFIG = {
     "screen_pool": 60,             # wallets whose settled history is checked
     "max_wallets": 30,             # wallets followed after screening
     "min_settled_bets": 20,        # settled bets needed before a wallet counts as proven
-    "min_proven_wallets": 8,       # below this many proven wallets, unproven ones fill the list
+    "min_proven_wallets": 15,      # below this many proven wallets, unproven ones fill the list
     "max_two_sided_frac": 0.15,    # drop wallets that held both sides in more than this share of their markets
-    "max_settled_positions": 500,  # drop wallets with more settled positions than this (high-frequency; trades are even more)
+    "max_settled_positions": 0,    # 0 = off. A cap of 500 dropped 27 of 66 wallets, i.e. almost every active top trader
     "high_price": 0.93,            # entries at or above this are near-certain bets
     "max_high_price_frac": 0.50,   # drop wallets whose bets are mostly near-certain (liquidity farming at 93c+)
     "hedge_ratio": 0.10,           # a wallet holding both sides of a market, smaller side at least this share, is hedged
@@ -88,14 +91,21 @@ CONFIG = {
     "min_wallets_bet": 2,
     "min_price": 0.10,             # what you would actually pay, fee included
     "max_price": 0.85,
-    "max_drift": 0.03,             # limit price ceiling: never more than 3c over their average entry
+    "max_drift": 0.05,             # limit price ceiling: never more than 5c over their average entry
     "max_opposition_ratio": 0.35,  # top-wallet money on the other side vs agreeing money
-    "max_spread": 0.06,            # best ask minus best bid
+    "max_spread": 0.08,            # best ask minus best bid
     "min_depth_multiple": 3.0,     # shares for sale within 3c of the best ask must cover this many stakes
     "exit_fraction": 0.5,          # fail if this share of earlier top holders has since sold out
     # Stage A: score weights (must add to 100)
     "weights": {"quality": 15, "agreement": 20, "entry": 15, "buying": 15,
                 "conviction": 10, "opposition": 10, "execution": 15},
+    # Independent check: devigged sportsbook odds (The Odds API, free key in env ODDS_API_KEY) for NFL and NBA games
+    "verify_required": True,       # a pick can only be above the line if sportsbooks agree it is underpriced
+    "min_book_edge": 0.03,         # sportsbook fair probability must beat your limit price by this much (3 cents)
+    "odds_regions": "us",
+    "odds_markets": "h2h,spreads,totals",   # credits per call = markets x regions = 3, once per sport per run
+    "odds_min_books": 2,           # sportsbooks quoting the exact same line before the consensus is trusted
+    "odds_min_remaining": 20,      # stop calling when this few credits are left
     # Staking: a % of bankroll, never more than the exposure cap in total per report
     "bankroll": 25.0,
     "stake_pct_min": 0.01,         # at the cutoff score
@@ -229,7 +239,7 @@ def wallet_flag(st):
     """Reason to drop a wallet as a market maker or farmer rather than a directional trader, or ''."""
     if st.get("two_sided") is not None and st["two_sided"] > CONFIG["max_two_sided_frac"]:
         return "holds both sides in %.0f%% of its markets (market maker)" % (st["two_sided"] * 100)
-    if (st.get("positions") or 0) > CONFIG["max_settled_positions"]:
+    if CONFIG["max_settled_positions"] and (st.get("positions") or 0) > CONFIG["max_settled_positions"]:
         return "%d settled positions (high-frequency)" % st["positions"]
     if st.get("hi_price") is not None and st["hi_price"] > CONFIG["max_high_price_frac"]:
         return "%.0f%% of bets entered at %.0fc or more (liquidity farming)" % (st["hi_price"] * 100, CONFIG["high_price"] * 100)
@@ -749,6 +759,7 @@ def build_candidates(wallet_positions, baseline):
             "holders": sorted(g["wallets"].items(), key=lambda kv: -kv[1]),
             "token_id": g["token_id"], "start": "", "end": g["end"], "category": "", "fee_rate": DEFAULT_FEE_RATE,
             "book": None, "exec_price": None, "all_in": None, "limit": None, "limit_ceiling": None, "fillable": True,
+            "fair": None, "book_edge": None, "books": None, "verify_note": "not checked yet",
             "tier": "watch", "why": [], "parts": {}, "score": 0.0, "drift": 0.0,
             "stake": None, "stake_pct": None, "capped": False,
             "specialty": "", "specialists": 0, "specialist_share": 0.0, "min_order_usd": None, "min_over_cap": False,
@@ -840,6 +851,12 @@ def assess(p):
         why.append("the price is %.0fc above their average entry" % (drift * 100))
     if p["opp_ratio"] > C["max_opposition_ratio"]:
         why.append("top wallets on the other side hold %.0f%% as much" % (p["opp_ratio"] * 100))
+    if C["verify_required"]:
+        if p.get("fair") is None:
+            why.append("not verified against sportsbooks: %s" % (p.get("verify_note") or "not checked"))
+        elif p["book_edge"] < C["min_book_edge"]:
+            why.append("sportsbooks price this at %.0f%%, only %+.1fc vs your %s limit (need +%.0fc)" % (
+                p["fair"] * 100, p["book_edge"] * 100, cents(entry_price(p)), C["min_book_edge"] * 100))
     b = p.get("book")
     if b:
         if b["exec_price"] is None:
@@ -906,6 +923,179 @@ def enrich(p):
         time.sleep(CONFIG["pause_seconds"])
 
 
+# ---------------- Independent check: sportsbook consensus (The Odds API) ----------------
+ODDS_API = "https://api.the-odds-api.com"
+ODDS_SPORTS = {"nfl": "americanfootball_nfl", "nba": "basketball_nba"}
+_ODDS = {"events": {}, "remaining": None, "note": "", "calls": 0}
+
+
+def norm_text(s):
+    return " " + re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip() + " "
+
+
+def team_in(full, text):
+    """True if a team's full name, or its last 1-3 words (the nickname: 'Trail Blazers', '49ers'), is in the normalized text."""
+    w = norm_text(full).split()
+    return any(len(w) >= k and (" " + " ".join(w[-k:]) + " ") in text for k in (3, 2, 1))
+
+
+def league_of(p):
+    slug = (p.get("event_slug") or p.get("slug") or "").lower()
+    for lg in ODDS_SPORTS:
+        if slug.startswith(lg + "-"):
+            return lg
+    return None
+
+
+def parse_market(p):
+    """(kind, line, line_team) for the market shapes Polymarket uses for games, or None.
+    'A vs. B: O/U 232.5' -> totals; 'Spread: A (-7.5)' -> spreads (the line belongs to A); 'A vs. B' -> moneyline."""
+    title = p.get("title") or ""
+    m = re.search(r"o/u\s*(\d+(?:\.\d+)?)", title, re.I)
+    if m and str(p.get("outcome") or "").lower() in ("over", "under"):
+        return "totals", float(m.group(1)), None
+    m = re.match(r"\s*spread:\s*(.+?)\s*\(([+-]?\d+(?:\.\d+)?)\)\s*$", title, re.I)
+    if m:
+        return "spreads", float(m.group(2)), m.group(1)
+    if re.search(r"\bvs\.?\s", title, re.I) and "o/u" not in title.lower():
+        return "h2h", None, None
+    return None
+
+
+def odds_get(league, key):
+    """One Odds API call. Returns (events, credits remaining or None). Never puts the key in an error message."""
+    q = urllib.parse.urlencode({"apiKey": key, "regions": CONFIG["odds_regions"], "markets": CONFIG["odds_markets"],
+                                "oddsFormat": "decimal", "dateFormat": "iso"})
+    url = "%s/v4/sports/%s/odds/?%s" % (ODDS_API, ODDS_SPORTS[league], q)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "polytracker/2.4"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+            rem = r.headers.get("x-requests-remaining")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %d" % e.code)
+    except Exception as e:
+        raise RuntimeError(e.__class__.__name__)
+    return (data if isinstance(data, list) else []), (int(float(rem)) if rem not in (None, "") else None)
+
+
+def odds_events(league):
+    """Upcoming games with bookmaker odds for a league, fetched at most once per run. None when unavailable."""
+    if league in _ODDS["events"]:
+        return _ODDS["events"][league]
+    data = None
+    key = os.environ.get("ODDS_API_KEY", "").strip()
+    if not key:
+        _ODDS["note"] = "no ODDS_API_KEY set"
+    elif _ODDS["remaining"] is not None and _ODDS["remaining"] < CONFIG["odds_min_remaining"]:
+        _ODDS["note"] = "Odds API credits nearly used up (%d left)" % _ODDS["remaining"]
+    else:
+        try:
+            data, rem = odds_get(league, key)
+            _ODDS["calls"] += 1
+            if rem is not None:
+                _ODDS["remaining"] = rem
+        except Exception as e:
+            _ODDS["note"] = "Odds API request failed (%s)" % e
+    _ODDS["events"][league] = data
+    return data
+
+
+def slug_date(p):
+    m = re.search(r"(\d{4}-\d{2}-\d{2})$", (p.get("event_slug") or p.get("slug") or ""))
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").replace(hour=18, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def book_probs(ev, kind, line, line_is_mine, outcome):
+    """Each bookmaker's vig-free probability for this exact outcome and line (proportional devig), one per bookmaker."""
+    out_text = norm_text(outcome)
+    target = None
+    if kind == "spreads":
+        target = line if line_is_mine else -line
+    probs = []
+    for bk in ev.get("bookmakers") or []:
+        for m in bk.get("markets") or []:
+            if m.get("key") != kind:
+                continue
+            outs = [o for o in (m.get("outcomes") or []) if num(o.get("price")) > 1.0]
+            if len(outs) < 2:
+                continue
+            if kind == "totals" and any(abs(num(o.get("point"), -999) - line) > 1e-6 for o in outs):
+                continue
+            imp = [1.0 / num(o["price"]) for o in outs]
+            tot = sum(imp)
+            hits = []
+            for o, i in zip(outs, imp):
+                if kind == "totals":
+                    ok = str(o.get("name") or "").lower() == str(outcome).lower()
+                elif kind == "spreads":
+                    ok = team_in(o.get("name"), out_text) and abs(num(o.get("point"), -999) - target) < 1e-6
+                else:
+                    ok = team_in(o.get("name"), out_text)
+                if ok:
+                    hits.append(i / tot)
+            if len(hits) == 1:
+                probs.append(hits[0])
+    return probs
+
+
+def verify_pick(p):
+    """Compare our limit price with the sportsbook consensus. Sets fair, books, book_edge (fair minus limit) and a note."""
+    p["fair"] = p["book_edge"] = p["books"] = None
+    p["verify_note"] = "no sportsbook check for this market"
+    lg = league_of(p)
+    if not lg:
+        return
+    mk = parse_market(p)
+    if not mk:
+        p["verify_note"] = "no sportsbook check for this type of market"
+        return
+    events = odds_events(lg)
+    if events is None:
+        p["verify_note"] = "sportsbook data unavailable (%s)" % (_ODDS["note"] or "no data")
+        return
+    kind, line, line_team = mk
+    text = norm_text("%s %s" % (p["title"], "" if kind == "totals" else p["outcome"]))
+    line_is_mine = bool(line_team) and norm_text(line_team) == norm_text(p["outcome"])
+    need = 1 if (kind == "spreads" and line_is_mine) else 2
+    start, _ = parse_dt(p.get("start"))
+    ref, window = (start, 6.0) if start else (slug_date(p), 36.0)
+    cands = []
+    for ev in events:
+        teams = [t for t in (ev.get("home_team"), ev.get("away_team")) if t]
+        if sum(1 for t in teams if team_in(t, text)) < need:
+            continue
+        when, _ = parse_dt(ev.get("commence_time"))
+        gap = abs((when - ref).total_seconds()) / 3600.0 if (when and ref) else None
+        if gap is not None and gap > window:
+            continue
+        cands.append((gap if gap is not None else 0.0, ev))
+    if not cands or (ref is None and len(cands) > 1):
+        p["verify_note"] = "no matching %s game found at the sportsbooks" % lg.upper()
+        return
+    ev = min(cands, key=lambda x: x[0])[1]
+    probs = book_probs(ev, kind, line, line_is_mine, p["outcome"])
+    if len(probs) < CONFIG["odds_min_books"]:
+        p["verify_note"] = "only %d sportsbook%s quote this exact line" % (len(probs), "" if len(probs) == 1 else "s")
+        return
+    p["fair"] = sum(probs) / len(probs)
+    p["books"] = len(probs)
+    p["book_edge"] = p["fair"] - entry_price(p)
+    p["verify_note"] = ""
+
+
+def verify_line(p):
+    if p.get("fair") is None:
+        return "Sportsbook check: " + (p.get("verify_note") or "not checked")
+    return "Sportsbook check: %d books price this at %.0f%% (vig removed); your limit is %s, an edge of %+.1f¢" % (
+        p["books"], p["fair"] * 100, cents(entry_price(p)), p["book_edge"] * 100)
+
+
 def apply_correlation(picks):
     """Only the best pick per event stays above the line: the others win or lose together with it."""
     picks.sort(key=lambda p: (p["tier"] != "bet", -p["score"]))
@@ -945,7 +1135,7 @@ def assign_stakes(picks):
 
 
 # ---------------- Step 5: paper-trade log + track record ----------------
-PICK_COLS = [("flagged_at", "TEXT"), ("condition_id", "TEXT"), ("outcome", "TEXT"), ("title", "TEXT"),
+PICK_COLS = [("fair_prob", "REAL"), ("book_edge", "REAL"), ("books", "INTEGER"), ("flagged_at", "TEXT"), ("condition_id", "TEXT"), ("outcome", "TEXT"), ("title", "TEXT"),
              ("entry_price", "REAL"), ("wallets", "INTEGER"), ("score", "REAL"), ("tier", "TEXT"), ("exec_price", "REAL"),
              ("bet_at", "TEXT"), ("bet_price", "REAL"), ("last_score", "REAL"), ("slug", "TEXT"), ("end_date", "TEXT"),
              ("resolved", "INTEGER"), ("final_price", "REAL"), ("last_price", "REAL"), ("last_checked", "TEXT"),
@@ -1007,13 +1197,19 @@ def log_picks(con, picks):
         if row is None:
             con.execute(
                 "INSERT INTO picks(flagged_at, condition_id, outcome, title, entry_price, wallets, score, tier,"
-                " exec_price, last_score, slug, end_date, bet_at, bet_price, engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " exec_price, last_score, slug, end_date, bet_at, bet_price, engine, fair_prob, book_edge, books)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now, p["condition_id"], p["outcome"], p["title"], p["mid"], p["wallets"], p["score"], p["tier"],
-                 p["all_in"], p["score"], p["slug"], p["end"], now if bet else None, price if bet else None, ENGINE_VERSION))
+                 p["all_in"], p["score"], p["slug"], p["end"], now if bet else None, price if bet else None, ENGINE_VERSION,
+                 p.get("fair"), p.get("book_edge"), p.get("books")))
         else:
             if bet and not row["bet_at"]:
-                con.execute("UPDATE picks SET bet_at = ?, bet_price = ?, exec_price = COALESCE(?, exec_price) WHERE id = ?",
-                            (now, price, p["all_in"], row["id"]))
+                con.execute("UPDATE picks SET bet_at = ?, bet_price = ?, exec_price = COALESCE(?, exec_price),"
+                            " fair_prob = COALESCE(?, fair_prob), book_edge = COALESCE(?, book_edge), books = COALESCE(?, books)"
+                            " WHERE id = ?", (now, price, p["all_in"], p.get("fair"), p.get("book_edge"), p.get("books"), row["id"]))
+            elif p.get("fair") is not None:
+                con.execute("UPDATE picks SET fair_prob = COALESCE(fair_prob, ?), book_edge = COALESCE(book_edge, ?),"
+                            " books = COALESCE(books, ?) WHERE id = ?", (p["fair"], p["book_edge"], p["books"], row["id"]))
             con.execute("UPDATE picks SET tier = ?, last_score = ?, wallets = ?, slug = ?, end_date = ? WHERE id = ?",
                         (p["tier"], p["score"], p["wallets"], p["slug"], p["end"], row["id"]))
     con.commit()
@@ -1055,7 +1251,7 @@ def summarize(items):
 def track_record(con, refresh=True):
     since = (datetime.now(timezone.utc) - timedelta(days=CONFIG["tracking_days"])).isoformat()
     cols = ("id, condition_id, outcome, entry_price, exec_price, bet_at, bet_price, last_score, "
-            "resolved, final_price, last_price, engine, flagged_at")
+            "resolved, final_price, last_price, engine, flagged_at, book_edge")
     rows = con.execute("SELECT " + cols + " FROM picks WHERE flagged_at >= ? ORDER BY flagged_at DESC", (since,)).fetchall()
     if refresh:
         lookups, seen = 0, {}
@@ -1088,7 +1284,7 @@ def track_record(con, refresh=True):
         cur = r["final_price"] if r["resolved"] else r["last_price"]
         if not entry or entry < 0.02 or cur is None:
             continue
-        item = {"entry": entry, "cur": cur, "resolved": bool(r["resolved"]), "score": r["last_score"] or 0.0,
+        item = {"entry": entry, "cur": cur, "resolved": bool(r["resolved"]), "score": r["last_score"] or 0.0, "edge": r["book_edge"],
                 "taker": (r["exec_price"] if (is_bet and r["engine"] == ENGINE_VERSION and r["exec_price"]
                                               and r["exec_price"] >= 0.02) else None)}
         if r["engine"] == ENGINE_VERSION:
@@ -1100,7 +1296,11 @@ def track_record(con, refresh=True):
     buckets = []
     for lo, hi, label in [(90, 101, "90-100"), (80, 90, "80-89"), (70, 80, "70-79"), (60, 70, "60-69"), (0, 60, "Under 60")]:
         buckets.append((label, summarize([i for i in all_items if lo <= i["score"] < hi])))
+    edge_items = [i for i in all_items if i.get("edge") is not None]
+    edge_buckets = [(label, summarize([i for i in edge_items if lo <= i["edge"] < hi]))
+                    for lo, hi, label in [(0.03, 9.0, "+3c or more"), (0.0, 0.03, "0 to +3c"), (-9.0, 0.0, "Below 0")]]
     return {"bet": summarize(bets), "watch": summarize(watch), "buckets": buckets, "total": len(all_items),
+            "edge_buckets": edge_buckets,
             "engine": ENGINE_VERSION, "since": min(started)[:10] if started else None,
             "earlier": {"bet": summarize(old_bets), "watch": summarize(old_watch), "n": len(old_bets) + len(old_watch)}}
 
@@ -1124,6 +1324,11 @@ def print_track_record(tr):
         print("\nEarlier rules (reference only, not used for the verdict):")
         show("Above the line", tr["earlier"]["bet"])
         show("Below the line", tr["earlier"]["watch"])
+    if any(s for _, s in tr.get("edge_buckets", [])):
+        print("\nBy sportsbook edge at entry (current rules):")
+        for label, s in tr["edge_buckets"]:
+            if s:
+                print("  %-12s %3d picks (%d settled), won %d, avg return %+.1f%%" % (label, s["n"], s["resolved"], s["wins"], s["avg_ret"] * 100))
     print("\nBy score (current rules):")
     for label, s in tr["buckets"]:
         if s:
@@ -1387,7 +1592,8 @@ def card(i, p, wallets):
         when_td + "</tr></table>" +
         "<div class='line2'><b>%d</b> top wallets agree%s with %s; %s on the other side. %s</div>" % (
             p["wallets"], indep_note, money(p["agree_money"]), money(p["oppose_money"]), conviction_text(p)) +
-        "<div class='sig'>%s</div><div class='sig'>%s</div>" % (escape(flow_line(p, None)), escape(exec_line(p))) +
+        "<div class='sig'>%s</div><div class='sig'>%s</div><div class='sig'>%s</div>" % (
+            escape(flow_line(p, None)), escape(exec_line(p)), escape(verify_line(p))) +
         spec_line +
         "<div class='holders'>Biggest: %s</div>" % holders +
         "<div class='parts'>Score parts: %s</div>" % parts +
@@ -1447,6 +1653,15 @@ def track_html(tr):
                 out.append("<tr><td>%s</td><td>%d</td><td class='%s'>%s</td><td>%+.1f¢</td></tr>" % (
                     label, s["n"], "pos" if s["avg_ret"] > 0 else "neg", pct_text(s["avg_ret"]), s["avg_move"]))
         out.append("</table></div>")
+        if any(s for _, s in tr.get("edge_buckets", [])):
+            out.append("<p class='note'>The independent test: do picks that sportsbooks say are underpriced do better than the rest?</p>"
+                       "<div class='scroll'><table class='tr'><tr><th>Sportsbook edge at entry</th><th>Picks</th><th>Settled wins</th>"
+                       "<th>Avg return (settled and open)</th></tr>")
+            for label, s in tr["edge_buckets"]:
+                if s:
+                    out.append("<tr><td>%s</td><td>%d</td><td>%d of %d</td><td class='%s'>%s</td></tr>" % (
+                        label, s["n"], s["wins"], s["resolved"], "pos" if s["avg_ret"] > 0 else "neg", pct_text(s["avg_ret"])))
+            out.append("</table></div>")
         b = tr["bet"]
         need = CONFIG["min_resolved_for_verdict"]
         if not b or b["resolved"] < need:
@@ -1585,8 +1800,9 @@ FOOT = ("<div class='foot'>Wallets come from the top %d by profit in at least %d
         "very high volume, near-certain bets) are dropped, and the rest are ranked by settled-bet edge, not raw profit. "
         "Score = trader quality (15) + wallet agreement (20, wallets that trade alike count once) + entry price (15) + recent buying (15) + "
         "conviction (10, bet size vs the wallet's own median bet) + low opposition (10) + execution (15). These weights are starting guesses, "
-        "not proven settings. Prices are resting limit buys (no taker fee), never more than 3c above their entry; if the market has moved past "
-        "that, the pick is below the line. Not financial advice. Copying means worse prices than the original traders, and no ranking "
+        "not proven settings. Prices are resting limit buys (no taker fee), capped a few cents above their entry; if the market has moved past "
+        "that, the pick is below the line. NFL and NBA picks are also checked against sportsbook odds (vig removed) and only count as "
+        "bets when the sportsbooks agree the price is low; other markets have no outside check and stay below the line. Not financial advice. Copying means worse prices than the original traders, and no ranking "
         "guarantees profit.</div>")
 
 TAB_JS = r"""<script>
@@ -1739,7 +1955,13 @@ def main():
     shortlist = candidates[: CONFIG["enrich_limit"]]
     for p in shortlist:
         enrich(p)
-        assess(p)                                    # second pass with dates, order book and fees
+        verify_pick(p)                               # sportsbook consensus for NFL and NBA games
+        assess(p)                                    # second pass with dates, order book, fees and the sportsbook check
+    nl = sum(1 for p in shortlist if league_of(p))
+    nv = sum(1 for p in shortlist if p.get("fair") is not None)
+    print("Sportsbook check: %d of %d NFL/NBA picks matched%s%s" % (
+        nv, nl, ("; credits left %d" % _ODDS["remaining"]) if _ODDS["remaining"] is not None else "",
+        ("; " + _ODDS["note"]) if _ODDS["note"] else ""))
     apply_correlation(shortlist)
     picks = shortlist[: CONFIG["max_listed"]]
     used, cap = assign_stakes(picks)
